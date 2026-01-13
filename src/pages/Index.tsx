@@ -1,23 +1,28 @@
 import { useState } from "react";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { DashboardHeader } from "@/components/DashboardHeader";
-import { FileUpload } from "@/components/FileUpload";
+import { ManualEntryForm } from "@/components/ManualEntryForm";
 import { StatsCards } from "@/components/StatsCards";
 import { PatientTable } from "@/components/PatientTable";
 import { ReadmissionChart } from "@/components/ReadmissionChart";
 import { RiskCalculator } from "@/components/RiskCalculator";
-import { parseCSV, calculateStats, getAgeGroupData } from "@/utils/csvParser";
+import { calculateStats, getAgeGroupData } from "@/utils/csvParser";
 import { Patient } from "@/types/patient";
-import { LayoutDashboard, Calculator } from "lucide-react";
+import { LayoutDashboard, Calculator, Activity, Users } from "lucide-react";
 
 const Index = () => {
   const [patients, setPatients] = useState<Patient[]>([]);
-  const [isDataLoaded, setIsDataLoaded] = useState(false);
 
-  const handleFileUpload = (content: string) => {
-    const parsedPatients = parseCSV(content);
-    setPatients(parsedPatients);
-    setIsDataLoaded(true);
+  const handleAddPatient = (patientData: Omit<Patient, "id">) => {
+    const newPatient: Patient = {
+      ...patientData,
+      id: patients.length + 1,
+    };
+    setPatients((prev) => [...prev, newPatient]);
+  };
+
+  const handleClearAll = () => {
+    setPatients([]);
   };
 
   const stats = calculateStats(patients);
@@ -41,43 +46,48 @@ const Index = () => {
           </TabsList>
 
           <TabsContent value="dashboard" className="space-y-6">
-            {!isDataLoaded ? (
-              <div className="max-w-xl mx-auto mt-12">
-                <div className="text-center mb-8">
-                  <h2 className="text-2xl font-semibold text-foreground mb-2">
-                    Upload Patient Data
-                  </h2>
-                  <p className="text-muted-foreground">
-                    Upload a CSV file to analyze patient readmission risk
-                  </p>
-                </div>
-                <FileUpload onFileUpload={handleFileUpload} />
-              </div>
-            ) : (
+            <ManualEntryForm
+              onAddPatient={handleAddPatient}
+              patientCount={patients.length}
+            />
+
+            {patients.length > 0 ? (
               <>
                 <StatsCards stats={stats} />
                 <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
                   <ReadmissionChart data={ageGroupData} />
                   <div className="stat-card animate-fade-in flex flex-col justify-center items-center text-center p-8">
                     <div className="w-16 h-16 rounded-full bg-primary/10 flex items-center justify-center mb-4">
-                      <Activity className="w-8 h-8 text-primary" />
+                      <Users className="w-8 h-8 text-primary" />
                     </div>
                     <h3 className="text-xl font-semibold text-foreground mb-2">
-                      Data Loaded Successfully
+                      {stats.totalPatients} Patient{stats.totalPatients !== 1 ? "s" : ""} Added
                     </h3>
                     <p className="text-muted-foreground mb-4">
-                      Analyzed {stats.totalPatients.toLocaleString()} patient records
+                      {stats.highRiskPatients} high-risk, {stats.totalPatients - stats.highRiskPatients} low-risk
                     </p>
                     <button
-                      onClick={() => setIsDataLoaded(false)}
-                      className="text-sm text-primary hover:underline"
+                      onClick={handleClearAll}
+                      className="text-sm text-destructive hover:underline"
                     >
-                      Upload different file
+                      Clear all patients
                     </button>
                   </div>
                 </div>
                 <PatientTable patients={patients} />
               </>
+            ) : (
+              <div className="stat-card animate-fade-in text-center py-12">
+                <div className="w-16 h-16 rounded-full bg-muted flex items-center justify-center mx-auto mb-4">
+                  <Activity className="w-8 h-8 text-muted-foreground" />
+                </div>
+                <h3 className="text-lg font-semibold text-foreground mb-2">
+                  No Patients Yet
+                </h3>
+                <p className="text-muted-foreground">
+                  Add your first patient using the form above to see analytics
+                </p>
+              </div>
             )}
           </TabsContent>
 
@@ -89,8 +99,5 @@ const Index = () => {
     </div>
   );
 };
-
-// Add Activity icon import at the top level for the success state
-import { Activity } from "lucide-react";
 
 export default Index;
