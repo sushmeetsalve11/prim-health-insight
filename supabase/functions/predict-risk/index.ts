@@ -6,23 +6,7 @@ const corsHeaders = {
   "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
 };
 
-// XGBoost model interface
-interface XGBoostModel {
-  feature_names: string[];
-  trees: XGBoostTree[];
-  base_score: number;
-  learning_rate?: number;
-}
-
-interface XGBoostTree {
-  split_feature?: number;
-  split_threshold?: number;
-  left_child?: XGBoostTree;
-  right_child?: XGBoostTree;
-  leaf_value?: number;
-}
-
-// Diagnosis category encoding
+// Diagnosis category encoding (must match training)
 const diagnosisMap: Record<string, number> = {
   "Circulatory": 0,
   "Respiratory": 1,
@@ -34,13 +18,39 @@ const diagnosisMap: Record<string, number> = {
   "Other": 7,
 };
 
-// Max glucose serum encoding
+// Max glucose serum encoding (must match training)
 const glucoseMap: Record<string, number> = {
   "None": 0,
   "Norm": 1,
   ">200": 2,
   ">300": 3,
 };
+
+// XGBoost native JSON model structure
+interface XGBoostTree {
+  base_weights: number[];
+  left_children: number[];
+  right_children: number[];
+  split_conditions: number[];
+  split_indices: number[];
+  default_left: number[];
+}
+
+interface XGBoostModel {
+  learner: {
+    learner_model_param: {
+      base_score: string;
+    };
+    gradient_booster: {
+      model: {
+        trees: XGBoostTree[];
+        gbtree_model_param: {
+          num_trees: string;
+        };
+      };
+    };
+  };
+}
 
 // Cache for the loaded model
 let cachedModel: XGBoostModel | null = null;
@@ -73,29 +83,37 @@ async function loadModel(): Promise<XGBoostModel | null> {
   }
 }
 
-// Traverse a single tree and get the leaf value
+// Traverse a single XGBoost tree (native format)
 function predictTree(tree: XGBoostTree, features: number[]): number {
-  if (tree.leaf_value !== undefined) {
-    return tree.leaf_value;
+  let nodeIndex = 0;
+  
+  while (tree.left_children[nodeIndex] !== -1) {
+    const splitFeature = tree.split_indices[nodeIndex];
+    const splitThreshold = tree.split_conditions[nodeIndex];
+    const featureValue = features[splitFeature];
+    
+    if (featureValue < splitThreshold) {
+      nodeIndex = tree.left_children[nodeIndex];
+    } else {
+      nodeIndex = tree.right_children[nodeIndex];
+    }
   }
-
-  const featureValue = features[tree.split_feature!];
-  if (featureValue < tree.split_threshold!) {
-    return predictTree(tree.left_child!, features);
-  } else {
-    return predictTree(tree.right_child!, features);
-  }
+  
+  return tree.base_weights[nodeIndex];
 }
 
-// XGBoost prediction (sum of tree predictions + base score, then sigmoid)
+// XGBoost prediction (sum of tree predictions, then sigmoid)
 function predictXGBoost(model: XGBoostModel, features: number[]): number {
-  let sum = model.base_score || 0;
+  const trees = model.learner.gradient_booster.model.trees;
+  const baseScore = parseFloat(model.learner.learner_model_param?.base_score || "0.5");
   
-  for (const tree of model.trees) {
+  let sum = 0;
+  for (const tree of trees) {
     sum += predictTree(tree, features);
   }
 
   // Apply sigmoid for binary classification
+  // XGBoost uses logistic loss, so we apply sigmoid to get probability
   const probability = 1 / (1 + Math.exp(-sum));
   return probability;
 }
@@ -105,7 +123,6 @@ function fallbackPrediction(age: number, n_inpatient: number, n_emergency: numbe
   let score = 0;
   const factors: string[] = [];
 
-  // Age factor
   if (age > 65) {
     score += 0.15;
     factors.push("Advanced age (>65 years)");
@@ -114,7 +131,6 @@ function fallbackPrediction(age: number, n_inpatient: number, n_emergency: numbe
     factors.push("Middle age (50-65 years)");
   }
 
-  // Inpatient visits
   if (n_inpatient > 2) {
     score += 0.35;
     factors.push("High inpatient visit history (>2 visits)");
@@ -123,7 +139,6 @@ function fallbackPrediction(age: number, n_inpatient: number, n_emergency: numbe
     factors.push("Previous inpatient visits");
   }
 
-  // Emergency visits
   if (n_emergency > 1) {
     score += 0.25;
     factors.push("Multiple emergency visits");
@@ -132,7 +147,6 @@ function fallbackPrediction(age: number, n_inpatient: number, n_emergency: numbe
     factors.push("Previous emergency visit");
   }
 
-  // A1C result (now numeric)
   if (a1c >= 8.0) {
     score += 0.25;
     factors.push("Poor glycemic control (A1C ≥ 8%)");
@@ -166,11 +180,11 @@ serve(async (req) => {
       }
     }
 
-    // Prepare features for XGBoost model
+    // Prepare features for XGBoost model (must match training order)
+    // Order: age, n_inpatient, n_emergency, A1Cresult, diag_code, glucose_code
     const diagCode = diagnosisMap[diag_1] ?? diagnosisMap["Other"];
     const glucoseCode = glucoseMap[max_glu_serum] ?? glucoseMap["None"];
     
-    // Feature vector: [age, n_inpatient, n_emergency, a1c_value, diag_code, glucose_code]
     const features = [
       age || 0,
       n_inpatient || 0,
@@ -179,6 +193,8 @@ serve(async (req) => {
       diagCode,
       glucoseCode,
     ];
+
+    console.log("Input features:", features);
 
     // Try to load and use XGBoost model
     const model = await loadModel();
@@ -190,8 +206,9 @@ serve(async (req) => {
     if (model) {
       try {
         score = predictXGBoost(model, features);
+        console.log("XGBoost prediction score:", score);
         
-        // Generate factors based on feature importance
+        // Generate factors based on input values
         if (n_inpatient > 0) factors.push(`${n_inpatient} inpatient visit(s) in past year`);
         if (n_emergency > 0) factors.push(`${n_emergency} emergency visit(s) in past year`);
         if (a1cValue >= 7.0) factors.push(`Elevated A1C (${a1cValue.toFixed(1)}%)`);
