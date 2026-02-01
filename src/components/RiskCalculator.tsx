@@ -97,9 +97,6 @@ export const RiskCalculator = () => {
               </h3>
               <Sparkles className="w-4 h-4 text-primary" />
             </div>
-            <p className="text-sm text-muted-foreground">
-              Powered by advanced AI for accurate readmission predictions
-            </p>
           </div>
         </div>
 
