@@ -1,9 +1,148 @@
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
 };
+
+// XGBoost model interface
+interface XGBoostModel {
+  feature_names: string[];
+  trees: XGBoostTree[];
+  base_score: number;
+  learning_rate?: number;
+}
+
+interface XGBoostTree {
+  split_feature?: number;
+  split_threshold?: number;
+  left_child?: XGBoostTree;
+  right_child?: XGBoostTree;
+  leaf_value?: number;
+}
+
+// Diagnosis category encoding
+const diagnosisMap: Record<string, number> = {
+  "Circulatory": 0,
+  "Respiratory": 1,
+  "Digestive": 2,
+  "Diabetes": 3,
+  "Injury": 4,
+  "Musculoskeletal": 5,
+  "Genitourinary": 6,
+  "Other": 7,
+};
+
+// Max glucose serum encoding
+const glucoseMap: Record<string, number> = {
+  "None": 0,
+  "Norm": 1,
+  ">200": 2,
+  ">300": 3,
+};
+
+// Cache for the loaded model
+let cachedModel: XGBoostModel | null = null;
+
+async function loadModel(): Promise<XGBoostModel | null> {
+  if (cachedModel) return cachedModel;
+
+  try {
+    const supabaseUrl = Deno.env.get("SUPABASE_URL")!;
+    const supabaseServiceKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
+    
+    const supabase = createClient(supabaseUrl, supabaseServiceKey);
+    
+    const { data, error } = await supabase.storage
+      .from("ml-models")
+      .download("xgboost_model.json");
+
+    if (error) {
+      console.error("Error loading model:", error);
+      return null;
+    }
+
+    const modelText = await data.text();
+    cachedModel = JSON.parse(modelText);
+    console.log("XGBoost model loaded successfully");
+    return cachedModel;
+  } catch (err) {
+    console.error("Failed to load XGBoost model:", err);
+    return null;
+  }
+}
+
+// Traverse a single tree and get the leaf value
+function predictTree(tree: XGBoostTree, features: number[]): number {
+  if (tree.leaf_value !== undefined) {
+    return tree.leaf_value;
+  }
+
+  const featureValue = features[tree.split_feature!];
+  if (featureValue < tree.split_threshold!) {
+    return predictTree(tree.left_child!, features);
+  } else {
+    return predictTree(tree.right_child!, features);
+  }
+}
+
+// XGBoost prediction (sum of tree predictions + base score, then sigmoid)
+function predictXGBoost(model: XGBoostModel, features: number[]): number {
+  let sum = model.base_score || 0;
+  
+  for (const tree of model.trees) {
+    sum += predictTree(tree, features);
+  }
+
+  // Apply sigmoid for binary classification
+  const probability = 1 / (1 + Math.exp(-sum));
+  return probability;
+}
+
+// Fallback rule-based prediction when model is not available
+function fallbackPrediction(age: number, n_inpatient: number, n_emergency: number, a1c: number): { score: number; factors: string[] } {
+  let score = 0;
+  const factors: string[] = [];
+
+  // Age factor
+  if (age > 65) {
+    score += 0.15;
+    factors.push("Advanced age (>65 years)");
+  } else if (age > 50) {
+    score += 0.08;
+    factors.push("Middle age (50-65 years)");
+  }
+
+  // Inpatient visits
+  if (n_inpatient > 2) {
+    score += 0.35;
+    factors.push("High inpatient visit history (>2 visits)");
+  } else if (n_inpatient > 0) {
+    score += 0.15;
+    factors.push("Previous inpatient visits");
+  }
+
+  // Emergency visits
+  if (n_emergency > 1) {
+    score += 0.25;
+    factors.push("Multiple emergency visits");
+  } else if (n_emergency > 0) {
+    score += 0.1;
+    factors.push("Previous emergency visit");
+  }
+
+  // A1C result (now numeric)
+  if (a1c >= 8.0) {
+    score += 0.25;
+    factors.push("Poor glycemic control (A1C ≥ 8%)");
+  } else if (a1c >= 7.0) {
+    score += 0.1;
+    factors.push("Suboptimal glycemic control (A1C 7-8%)");
+  }
+
+  return { score: Math.min(score, 1), factors };
+}
 
 serve(async (req) => {
   if (req.method === "OPTIONS") {
@@ -12,112 +151,82 @@ serve(async (req) => {
 
   try {
     const { age, n_inpatient, n_emergency, A1Cresult, max_glu_serum, diag_1 } = await req.json();
-    
-    const LOVABLE_API_KEY = Deno.env.get("LOVABLE_API_KEY");
-    if (!LOVABLE_API_KEY) {
-      throw new Error("LOVABLE_API_KEY is not configured");
-    }
 
-    const systemPrompt = `You are a healthcare risk prediction AI assistant. Analyze patient data to predict 30-day hospital readmission risk.
-
-You must analyze the following clinical factors and their interactions:
-- Age: Older patients (>65) have higher readmission risk
-- Number of inpatient visits (n_inpatient): Higher count indicates chronic illness patterns
-- Number of emergency visits (n_emergency): Indicates acute health instability
-- A1C result: Poor glycemic control (>8%) is a strong predictor
-- Maximum glucose serum: Abnormal glucose levels indicate metabolic issues
-- Primary diagnosis: Certain conditions have higher readmission rates
-
-Consider these clinical interactions:
-1. Age + multiple inpatient visits = compounded risk
-2. Poor A1C + high glucose = severe diabetic risk
-3. Emergency visits + older age = acute-on-chronic pattern
-
-Respond ONLY with valid JSON in this exact format:
-{
-  "risk": "High Risk" or "Low Risk",
-  "score": number between 0 and 1,
-  "confidence": "High", "Medium", or "Low",
-  "factors": ["array of contributing factors"],
-  "recommendation": "brief clinical recommendation"
-}`;
-
-    const userPrompt = `Analyze this patient for 30-day readmission risk:
-- Age: ${age} years
-- Inpatient visits (last year): ${n_inpatient}
-- Emergency visits (last year): ${n_emergency}
-- A1C Result: ${A1Cresult}
-- Max Glucose Serum: ${max_glu_serum || "Not measured"}
-- Primary Diagnosis: ${diag_1 || "Not specified"}
-
-Provide your risk assessment as JSON.`;
-
-    console.log("Calling AI gateway for risk prediction...");
-
-    const response = await fetch("https://ai.gateway.lovable.dev/v1/chat/completions", {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${LOVABLE_API_KEY}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        model: "google/gemini-3-flash-preview",
-        messages: [
-          { role: "system", content: systemPrompt },
-          { role: "user", content: userPrompt },
-        ],
-        temperature: 0.3,
-      }),
-    });
-
-    if (!response.ok) {
-      if (response.status === 429) {
-        return new Response(
-          JSON.stringify({ error: "Rate limit exceeded. Please try again later." }),
-          { status: 429, headers: { ...corsHeaders, "Content-Type": "application/json" } }
-        );
+    // Parse A1C - handle both string (">8%") and numeric formats
+    let a1cValue = 0;
+    if (typeof A1Cresult === "number") {
+      a1cValue = A1Cresult;
+    } else if (typeof A1Cresult === "string") {
+      if (A1Cresult === ">8%" || A1Cresult === ">8") {
+        a1cValue = 9.0;
+      } else if (A1Cresult === ">7%" || A1Cresult === ">7") {
+        a1cValue = 7.5;
+      } else {
+        a1cValue = parseFloat(A1Cresult) || 6.0;
       }
-      if (response.status === 402) {
-        return new Response(
-          JSON.stringify({ error: "API credits exhausted. Please add credits to continue." }),
-          { status: 402, headers: { ...corsHeaders, "Content-Type": "application/json" } }
-        );
-      }
-      const errorText = await response.text();
-      console.error("AI gateway error:", response.status, errorText);
-      throw new Error(`AI gateway error: ${response.status}`);
     }
 
-    const data = await response.json();
-    const content = data.choices?.[0]?.message?.content;
+    // Prepare features for XGBoost model
+    const diagCode = diagnosisMap[diag_1] ?? diagnosisMap["Other"];
+    const glucoseCode = glucoseMap[max_glu_serum] ?? glucoseMap["None"];
     
-    console.log("AI response:", content);
+    // Feature vector: [age, n_inpatient, n_emergency, a1c_value, diag_code, glucose_code]
+    const features = [
+      age || 0,
+      n_inpatient || 0,
+      n_emergency || 0,
+      a1cValue,
+      diagCode,
+      glucoseCode,
+    ];
 
-    // Parse the JSON from the AI response
-    let prediction;
-    try {
-      // Extract JSON from potential markdown code blocks
-      const jsonMatch = content.match(/```json\s*([\s\S]*?)\s*```/) || 
-                        content.match(/```\s*([\s\S]*?)\s*```/) ||
-                        [null, content];
-      prediction = JSON.parse(jsonMatch[1] || content);
-    } catch (parseError) {
-      console.error("Failed to parse AI response:", parseError);
-      // Fallback to rule-based prediction
-      let score = 0;
-      if (n_inpatient > 1) score += 0.4;
-      if (n_emergency > 0) score += 0.2;
-      if (age > 65) score += 0.15;
-      if (A1Cresult === '>8%') score += 0.25;
-      
-      prediction = {
-        risk: score > 0.5 ? "High Risk" : "Low Risk",
-        score: Math.min(score, 1),
-        confidence: "Medium",
-        factors: ["Fallback prediction - AI parsing failed"],
-        recommendation: "Consider manual review of patient factors."
-      };
+    // Try to load and use XGBoost model
+    const model = await loadModel();
+    
+    let score: number;
+    let factors: string[] = [];
+    let modelUsed = "xgboost";
+
+    if (model) {
+      try {
+        score = predictXGBoost(model, features);
+        
+        // Generate factors based on feature importance
+        if (n_inpatient > 0) factors.push(`${n_inpatient} inpatient visit(s) in past year`);
+        if (n_emergency > 0) factors.push(`${n_emergency} emergency visit(s) in past year`);
+        if (a1cValue >= 7.0) factors.push(`Elevated A1C (${a1cValue.toFixed(1)}%)`);
+        if (age > 60) factors.push(`Age factor (${age} years)`);
+        if (diag_1) factors.push(`Primary diagnosis: ${diag_1}`);
+        if (max_glu_serum && max_glu_serum !== "None" && max_glu_serum !== "Norm") {
+          factors.push(`Elevated glucose serum (${max_glu_serum})`);
+        }
+      } catch (err) {
+        console.error("XGBoost prediction failed, using fallback:", err);
+        const fallback = fallbackPrediction(age, n_inpatient, n_emergency, a1cValue);
+        score = fallback.score;
+        factors = fallback.factors;
+        modelUsed = "fallback";
+      }
+    } else {
+      console.log("No XGBoost model found, using fallback prediction");
+      const fallback = fallbackPrediction(age, n_inpatient, n_emergency, a1cValue);
+      score = fallback.score;
+      factors = fallback.factors;
+      modelUsed = "fallback";
     }
+
+    const isHighRisk = score > 0.5;
+    
+    const prediction = {
+      risk: isHighRisk ? "High Risk" : "Low Risk",
+      score: score,
+      confidence: modelUsed === "xgboost" ? "High" : "Medium",
+      factors: factors.length > 0 ? factors : ["No significant risk factors identified"],
+      recommendation: isHighRisk
+        ? "Consider close follow-up, medication reconciliation, and care coordination to reduce readmission risk."
+        : "Standard discharge protocol recommended. Ensure patient education and follow-up scheduling.",
+      model: modelUsed,
+    };
 
     return new Response(JSON.stringify(prediction), {
       headers: { ...corsHeaders, "Content-Type": "application/json" },
