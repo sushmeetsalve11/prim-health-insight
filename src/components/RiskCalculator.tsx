@@ -1,5 +1,5 @@
-import { useState } from "react";
-import { Calculator, AlertCircle, CheckCircle, Loader2, Brain, Sparkles } from "lucide-react";
+import { useState, useCallback } from "react";
+import { AlertCircle, CheckCircle, Loader2, Brain, Sparkles, Upload, FileText, Keyboard } from "lucide-react";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Button } from "@/components/ui/button";
@@ -22,6 +22,7 @@ interface AIResult {
 }
 
 export const RiskCalculator = () => {
+  const [mode, setMode] = useState<"manual" | "upload">("upload");
   const [age, setAge] = useState("");
   const [nInpatient, setNInpatient] = useState("");
   const [nEmergency, setNEmergency] = useState("");
@@ -30,6 +31,84 @@ export const RiskCalculator = () => {
   const [diag1, setDiag1] = useState("");
   const [result, setResult] = useState<AIResult | null>(null);
   const [isLoading, setIsLoading] = useState(false);
+  const [isParsing, setIsParsing] = useState(false);
+  const [parseSummary, setParseSummary] = useState("");
+
+  const handleFileUpload = useCallback(async (file: File) => {
+    if (!file) return;
+
+    const allowedTypes = ["image/jpeg", "image/png", "image/webp", "application/pdf"];
+    if (!allowedTypes.includes(file.type)) {
+      toast.error("Please upload a PDF or image file (JPG, PNG, WEBP)");
+      return;
+    }
+
+    if (file.size > 10 * 1024 * 1024) {
+      toast.error("File size must be under 10MB");
+      return;
+    }
+
+    setIsParsing(true);
+    setParseSummary("");
+    setResult(null);
+
+    try {
+      const reader = new FileReader();
+      const base64 = await new Promise<string>((resolve, reject) => {
+        reader.onload = () => resolve(reader.result as string);
+        reader.onerror = reject;
+        reader.readAsDataURL(file);
+      });
+
+      const { data, error } = await supabase.functions.invoke("parse-report", {
+        body: { image: base64 },
+      });
+
+      if (error) {
+        console.error("Parse error:", error);
+        toast.error("Failed to parse report. Please try manual entry.");
+        return;
+      }
+
+      if (data.error) {
+        toast.error(data.error);
+        return;
+      }
+
+      // Fill form fields from extracted data
+      if (data.age) setAge(String(data.age));
+      if (data.n_inpatient != null) setNInpatient(String(data.n_inpatient));
+      if (data.n_emergency != null) setNEmergency(String(data.n_emergency));
+      if (data.A1Cresult) setA1cResult(data.A1Cresult);
+      if (data.max_glu_serum) setMaxGluSerum(data.max_glu_serum === "normal" ? "normal" : data.max_glu_serum);
+      if (data.diag_1) setDiag1(data.diag_1);
+      if (data.summary) setParseSummary(data.summary);
+
+      toast.success("Report parsed successfully! Review the extracted data below.");
+    } catch (err) {
+      console.error("Upload error:", err);
+      toast.error("Failed to process report.");
+    } finally {
+      setIsParsing(false);
+    }
+  }, []);
+
+  const handleDrop = useCallback(
+    (e: React.DragEvent<HTMLDivElement>) => {
+      e.preventDefault();
+      const file = e.dataTransfer.files[0];
+      if (file) handleFileUpload(file);
+    },
+    [handleFileUpload]
+  );
+
+  const handleFileInput = useCallback(
+    (e: React.ChangeEvent<HTMLInputElement>) => {
+      const file = e.target.files?.[0];
+      if (file) handleFileUpload(file);
+    },
+    [handleFileUpload]
+  );
 
   const handleCalculate = async () => {
     if (!age) {
@@ -81,6 +160,7 @@ export const RiskCalculator = () => {
     setMaxGluSerum("");
     setDiag1("");
     setResult(null);
+    setParseSummary("");
   };
 
   return (
@@ -100,6 +180,84 @@ export const RiskCalculator = () => {
           </div>
         </div>
 
+        {/* Mode Toggle */}
+        <div className="flex gap-2 mb-6">
+          <Button
+            variant={mode === "upload" ? "default" : "outline"}
+            size="sm"
+            onClick={() => setMode("upload")}
+            className="flex-1"
+          >
+            <Upload className="w-4 h-4 mr-2" />
+            Upload Report
+          </Button>
+          <Button
+            variant={mode === "manual" ? "default" : "outline"}
+            size="sm"
+            onClick={() => setMode("manual")}
+            className="flex-1"
+          >
+            <Keyboard className="w-4 h-4 mr-2" />
+            Manual Entry
+          </Button>
+        </div>
+
+        {/* Upload Area */}
+        {mode === "upload" && (
+          <div className="mb-6">
+            <div
+              onDrop={handleDrop}
+              onDragOver={(e) => e.preventDefault()}
+              className="border-2 border-dashed border-primary/30 rounded-xl p-8 text-center hover:border-primary/50 hover:bg-primary/5 transition-all cursor-pointer group"
+            >
+              <input
+                type="file"
+                accept=".pdf,.jpg,.jpeg,.png,.webp"
+                onChange={handleFileInput}
+                className="hidden"
+                id="report-upload"
+                disabled={isParsing}
+              />
+              <label htmlFor="report-upload" className="cursor-pointer">
+                <div className="flex flex-col items-center gap-3">
+                  {isParsing ? (
+                    <>
+                      <Loader2 className="w-10 h-10 text-primary animate-spin" />
+                      <p className="text-sm font-medium text-foreground">
+                        Analyzing report with AI...
+                      </p>
+                    </>
+                  ) : (
+                    <>
+                      <div className="w-12 h-12 rounded-full bg-primary/10 flex items-center justify-center group-hover:bg-primary/20 transition-colors">
+                        <Upload className="w-6 h-6 text-primary" />
+                      </div>
+                      <div>
+                        <p className="text-sm font-semibold text-foreground">
+                          Drop your blood report here
+                        </p>
+                        <p className="text-xs text-muted-foreground mt-1">
+                          or click to browse • PDF, JPG, PNG supported
+                        </p>
+                      </div>
+                    </>
+                  )}
+                </div>
+              </label>
+            </div>
+
+            {parseSummary && (
+              <div className="mt-3 p-3 rounded-lg bg-primary/5 border border-primary/20">
+                <div className="flex items-start gap-2">
+                  <FileText className="w-4 h-4 text-primary mt-0.5 flex-shrink-0" />
+                  <p className="text-sm text-muted-foreground">{parseSummary}</p>
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* Form Fields */}
         <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
           <div className="space-y-2">
             <Label htmlFor="age">Age *</Label>
@@ -176,7 +334,7 @@ export const RiskCalculator = () => {
         </div>
 
         <div className="flex gap-3 mt-6">
-          <Button onClick={handleCalculate} className="flex-1" disabled={isLoading}>
+          <Button onClick={handleCalculate} className="flex-1" disabled={isLoading || isParsing}>
             {isLoading ? (
               <>
                 <Loader2 className="w-4 h-4 mr-2 animate-spin" />
@@ -189,7 +347,7 @@ export const RiskCalculator = () => {
               </>
             )}
           </Button>
-          <Button variant="outline" onClick={handleReset} disabled={isLoading}>
+          <Button variant="outline" onClick={handleReset} disabled={isLoading || isParsing}>
             Reset
           </Button>
         </div>
