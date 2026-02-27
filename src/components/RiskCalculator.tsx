@@ -246,27 +246,6 @@ export const RiskCalculator = () => {
               </label>
             </div>
 
-            <div className="flex items-center gap-3 mt-3">
-              <Button
-                variant="outline"
-                size="sm"
-                onClick={() => {
-                  setAge("72");
-                  setNInpatient("2");
-                  setNEmergency("3");
-                  setA1cResult(">8%");
-                  setMaxGluSerum(">300");
-                  setDiag1("Diabetes");
-                  setParseSummary("Demo: 72-year-old male with uncontrolled Type 2 Diabetes. HbA1c 9.2%, fasting glucose 312 mg/dL, 3 ER visits and 2 inpatient admissions in the past year.");
-                  toast.success("Demo report loaded! Click 'Calculate Risk' to see results.");
-                }}
-                disabled={isParsing}
-              >
-                <FileText className="w-4 h-4 mr-2" />
-                Try Demo Report
-              </Button>
-              <span className="text-xs text-muted-foreground">Load a sample blood report to test</span>
-            </div>
 
             {parseSummary && (
               <div className="mt-3 p-3 rounded-lg bg-primary/5 border border-primary/20">
